@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { triggerLocalDownload } from './failed-uploads.js';
+import { triggerLocalDownload, storeFailedUpload, updateRetryCount } from './failed-uploads.js';
 
 describe('triggerLocalDownload', () => {
     let originalDocument;
@@ -81,5 +81,144 @@ describe('triggerLocalDownload', () => {
         global.URL.createObjectURL = vi.fn(() => { throw new Error('boom'); });
         const result = triggerLocalDownload({ size: 1 }, 'x.webm');
         expect(result).toBe(false);
+    });
+});
+
+/**
+ * Regression tests for the IndexedDB transaction-lifetime bug (TransactionInactiveError).
+ *
+ * IndexedDB auto-commits ("finishes") a transaction as soon as control returns
+ * to the event loop with no pending requests outstanding against it. So any
+ * `await` of a non-IndexedDB promise (e.g. File.arrayBuffer(), or a nested
+ * helper that opens its own transaction) between `db.transaction(...)` and the
+ * first request kills the transaction. These tests model that semantics: the
+ * mock transaction goes inactive on the next microtask, and add()/put() throw
+ * if used after that, exactly like a real browser.
+ */
+describe('IndexedDB transaction lifetime', () => {
+    let originalIndexedDB;
+    let store;
+
+    // Build a mock that mirrors the real auto-commit-on-yield behaviour.
+    const makeMockDB = () => {
+        store = new Map();
+        let nextId = 1;
+
+        const makeRequest = (op) => {
+            const request = {};
+            // Fire callbacks asynchronously, like a real IDBRequest.
+            queueMicrotask(() => {
+                try {
+                    const result = op();
+                    request.result = result;
+                    request.onsuccess?.();
+                } catch (err) {
+                    request.error = err;
+                    request.onerror?.();
+                }
+            });
+            return request;
+        };
+
+        const db = {
+            transaction() {
+                const tx = { _active: true };
+                // The transaction commits/finishes once the current task yields.
+                queueMicrotask(() => { tx._active = false; });
+
+                const objectStore = {
+                    add(value) {
+                        if (!tx._active) {
+                            throw new DOMException(
+                                "Failed to execute 'add' on 'IDBObjectStore': The transaction has finished.",
+                                'TransactionInactiveError'
+                            );
+                        }
+                        return makeRequest(() => {
+                            const id = nextId++;
+                            store.set(id, { ...value, id });
+                            return id;
+                        });
+                    },
+                    put(value) {
+                        if (!tx._active) {
+                            throw new DOMException(
+                                "Failed to execute 'put' on 'IDBObjectStore': The transaction has finished.",
+                                'TransactionInactiveError'
+                            );
+                        }
+                        return makeRequest(() => {
+                            store.set(value.id, { ...value });
+                            return value.id;
+                        });
+                    },
+                    get(id) {
+                        return makeRequest(() => store.get(id));
+                    },
+                };
+                tx.objectStore = () => objectStore;
+                return tx;
+            },
+            objectStoreNames: { contains: () => true },
+        };
+        return db;
+    };
+
+    beforeEach(() => {
+        originalIndexedDB = global.indexedDB;
+        const db = makeMockDB();
+        global.indexedDB = {
+            open: vi.fn(() => {
+                const request = {};
+                queueMicrotask(() => {
+                    request.result = db;
+                    request.onsuccess?.();
+                });
+                return request;
+            }),
+        };
+    });
+
+    afterEach(() => {
+        global.indexedDB = originalIndexedDB;
+        vi.resetModules();
+    });
+
+    it('storeFailedUpload persists a record when the file must be read to an ArrayBuffer', async () => {
+        const file = {
+            name: 'recording.webm',
+            size: 2048,
+            type: 'audio/webm',
+            arrayBuffer: async () => new ArrayBuffer(8),
+        };
+
+        const id = await storeFailedUpload({
+            file,
+            clientId: 'client-123',
+            notes: 'n',
+            tags: ['t'],
+            asrOptions: {},
+            error: '413 Payload Too Large',
+        });
+
+        expect(id).toBeTruthy();
+        const stored = store.get(id);
+        expect(stored.fileName).toBe('recording.webm');
+        expect(stored.fileData).toBeInstanceOf(ArrayBuffer);
+        expect(stored.lastError).toBe('413 Payload Too Large');
+    });
+
+    it('updateRetryCount updates an existing record without a finished transaction', async () => {
+        // Seed a record first.
+        const file = {
+            name: 'r.webm', size: 10, type: 'audio/webm',
+            arrayBuffer: async () => new ArrayBuffer(4),
+        };
+        const id = await storeFailedUpload({ file, clientId: 'c' });
+
+        await expect(updateRetryCount(id, 2, 'still failing')).resolves.not.toThrow();
+        const updated = store.get(id);
+        expect(updated.retryCount).toBe(2);
+        expect(updated.lastError).toBe('still failing');
     });
 });

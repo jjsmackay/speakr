@@ -52,8 +52,6 @@ export const initDB = () => {
 export const storeFailedUpload = async (uploadData) => {
     try {
         const db = await initDB();
-        const transaction = db.transaction([STORE_NAME], 'readwrite');
-        const objectStore = transaction.objectStore(STORE_NAME);
 
         const failedUpload = {
             timestamp: Date.now(),
@@ -69,11 +67,17 @@ export const storeFailedUpload = async (uploadData) => {
             mimeType: uploadData.file?.type || uploadData.mimeType || 'audio/webm'
         };
 
-        // Convert File to ArrayBuffer if needed
+        // Convert File to ArrayBuffer if needed. This MUST complete before the
+        // transaction is opened: an IndexedDB transaction auto-commits as soon
+        // as control returns to the event loop with no pending request against
+        // it, so awaiting here after opening the transaction would let it
+        // finish before objectStore.add() runs (TransactionInactiveError).
         if (uploadData.file && !failedUpload.fileData) {
             failedUpload.fileData = await uploadData.file.arrayBuffer();
         }
 
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const objectStore = transaction.objectStore(STORE_NAME);
         const request = objectStore.add(failedUpload);
 
         return new Promise((resolve, reject) => {
@@ -153,9 +157,11 @@ export const getFailedUpload = async (id) => {
 export const updateRetryCount = async (id, retryCount, error = null) => {
     try {
         const db = await initDB();
-        const transaction = db.transaction([STORE_NAME], 'readwrite');
-        const objectStore = transaction.objectStore(STORE_NAME);
 
+        // Read the existing record before opening the write transaction.
+        // getFailedUpload opens and awaits its own transaction; doing that
+        // after opening the readwrite transaction below would let the latter
+        // auto-commit before put() runs (TransactionInactiveError).
         const upload = await getFailedUpload(id);
         if (!upload) {
             console.warn('[FailedUploadsDB] Upload not found for retry count update');
@@ -167,6 +173,9 @@ export const updateRetryCount = async (id, retryCount, error = null) => {
         if (error) {
             upload.lastError = error;
         }
+
+        const transaction = db.transaction([STORE_NAME], 'readwrite');
+        const objectStore = transaction.objectStore(STORE_NAME);
 
         return new Promise((resolve, reject) => {
             const request = objectStore.put(upload);
